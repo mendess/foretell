@@ -6,8 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.57"
+anyhow = "1.0.58"
+chrono = "0.4.19"
+dirs = "4.0.0"
 notify-rust = "4.5.8"
-reqwest = { version = "0.11.10", features = ["blocking"] }
-scryfall = "0.10.2"
+reqwest = { version = "0.11.11", features = ["blocking"] }
+scryfall = "0.10.3"
 tempfile = "3.3.0"
