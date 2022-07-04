@@ -47,8 +47,25 @@ fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
     let mut all_sets = Vec::new();
     let mut updated_cards = false;
     let today = chrono::Utc::today().naive_utc();
-    for Set { code, name, .. } in scryfall::set::Set::all()?
+    for Set {
+        code,
+        name,
+        set_type,
+        ..
+    } in scryfall::set::Set::all()?
         .filter_map(Result::ok)
+        .filter(|s| {
+            [
+                SetType::Memorabilia,
+                SetType::Token,
+                SetType::Alchemy,
+                SetType::TreasureChest,
+                SetType::Promo,
+            ]
+            .into_iter()
+            .all(|t| s.set_type != t)
+        })
+        .filter(|s| !s.digital)
         .filter(|s| matches!(s.released_at, Some(d) if d <= today))
     {
         all_sets.push(code);
@@ -56,6 +73,7 @@ fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
             .binary_search_by(|s| s.as_str().cmp(code.get()))
             .is_err()
         {
+            println!("updating card list for {name} ({code}) :: {set_type}");
             match update_card_list(cards_cache, code, &name)
                 .with_context(|| format!("updating card list for set {name} ({code})"))
             {
@@ -103,13 +121,7 @@ fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> anyhow::R
     const JUST_DONT: &str = "Our Market Research Shows That Players Like Really Long Card Names So We Made this Card to Have the Absolute Longest Card Name Ever Elemental";
     use scryfall::search::prelude::*;
     let today = chrono::Utc::today().naive_utc();
-    let count = match Card::search(
-        set(set_code)
-            .and(not(set_type(SetType::Memorabilia)))
-            .and(not(set_type(SetType::Token)))
-            .and(game(Game::Paper))
-            .and(date(lte(today))),
-    ) {
+    let count = match Card::search(set(set_code).and(game(Game::Paper)).and(date(lte(today)))) {
         Ok(cards) => cards
             .filter_map(Result::ok)
             .filter(|c| !c.type_line.contains("Basic") && !c.type_line.contains("Token"))
