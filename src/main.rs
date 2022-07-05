@@ -184,31 +184,41 @@ fn query() -> anyhow::Result<String> {
 }
 
 fn run() -> anyhow::Result<()> {
-    let query = dbg!(query()?);
+    let query = query()?;
     if query.is_empty() {
         return Ok(());
     }
+    let query = dbg!(query.replace('/', ""));
     let cards = Card::search(&query)?
         .map(|c| {
             c.map(|mut c| {
-                if let Some(faces) = c.card_faces.take() {
+                let uris = if let Some(large) = c.image_uris.remove("large") {
+                    vec![large.to_string()]
+                } else if let Some(faces) = c.card_faces.take() {
                     faces
                         .into_iter()
                         .filter_map(|face| face.image_uris.and_then(|mut u| u.remove("large")))
                         .collect::<Vec<_>>()
                 } else {
-                    c.image_uris
-                        .remove("large")
-                        .map(|u| u.to_string())
-                        .into_iter()
-                        .collect()
+                    vec![]
+                };
+                if uris.is_empty() {
+                    error(anyhow::anyhow!(
+                        "failed to get any uris for card {}",
+                        c.name
+                    ));
                 }
+                uris
             })
         })
         .try_fold(Vec::new(), |mut acc, v| -> Result<_, Error> {
             acc.extend(v?);
             Ok(acc)
         })?;
+
+    if cards.is_empty() {
+        return Err(anyhow::anyhow!("no cards found"));
+    }
 
     let client = reqwest::blocking::Client::new();
     let files = cards
@@ -220,12 +230,16 @@ fn run() -> anyhow::Result<()> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Command::new("sxiv")
+    let status = Command::new("sxiv")
         .args(["-b", "-g", "590x800"])
         .args(files.iter().map(|f| f.path()))
         .spawn()?
         .wait()?;
-    Ok(())
+    if !status.success() {
+        Err(anyhow::anyhow!("sxiv error {status}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn main() {
