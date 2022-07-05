@@ -7,12 +7,14 @@ use scryfall::{
     Error, Set,
 };
 use std::{
+    cell::RefCell,
     fmt::Display,
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Write},
     os::unix::prelude::ExitStatusExt,
     path::Path,
     process::{Command, Stdio},
+    thread::{self, JoinHandle},
 };
 use tempfile::NamedTempFile;
 
@@ -142,6 +144,10 @@ fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> anyhow::R
     Ok(true)
 }
 
+thread_local! {
+    static BACKGROUND_UPDATE: RefCell<Option<JoinHandle<()>>> = RefCell::new(None);
+}
+
 fn card_list() -> anyhow::Result<File> {
     let path = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("can't find cache dir"))?
@@ -152,9 +158,35 @@ fn card_list() -> anyhow::Result<File> {
     println!("getting missing sets");
     let sets_cache = path.join("sets");
     let card_list_file = path.join("cards");
-    missing_sets(&sets_cache, &card_list_file).context("getting missing sets")?;
+    let lock_file = path.join("lock");
+    let _ = File::options()
+        .create_new(true)
+        .write(true)
+        .open(&lock_file);
+    match fmutex::try_lock(&lock_file) {
+        Ok(Some(guard)) => {
+            let handle = thread::spawn({
+                let card_list_file = card_list_file.clone();
+                move || {
+                    if let Err(e) = missing_sets(&sets_cache, &card_list_file) {
+                        error(e)
+                    }
+                    drop(guard);
+                }
+            });
+            BACKGROUND_UPDATE.with(|u| *u.borrow_mut() = Some(handle));
+        }
+        Ok(None) => {}
+        Err(e) => error(anyhow::anyhow!("failed to lock {lock_file:?}: {e}")),
+    }
 
-    Ok(File::open(card_list_file)?)
+    match File::open(card_list_file) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            File::open("/dev/null").map_err(Into::into)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn query() -> anyhow::Result<String> {
@@ -188,7 +220,6 @@ fn run() -> anyhow::Result<()> {
     if query.is_empty() {
         return Ok(());
     }
-    let query = dbg!(query.replace('/', ""));
     let cards = Card::search(&query)?
         .map(|c| {
             c.map(|mut c| {
@@ -246,4 +277,13 @@ fn main() {
     if let Err(e) = run() {
         error(e)
     }
+    BACKGROUND_UPDATE.with(|j| {
+        if let Some(j) = j.borrow_mut().take() {
+            if let Err(e) = j.join() {
+                error(anyhow::anyhow!("background update thread panicked: {e:?}"));
+            } else {
+                println!("background task ended");
+            }
+        }
+    })
 }
