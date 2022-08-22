@@ -8,6 +8,7 @@ use scryfall::{
 };
 use std::{
     cell::RefCell,
+    collections::HashSet,
     fmt::Display,
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Write},
@@ -190,17 +191,32 @@ fn card_list() -> anyhow::Result<File> {
 }
 
 fn query() -> anyhow::Result<String> {
-    let output = Command::new("dmenu")
+    let card_list_file = match card_list() {
+        Ok(f) => f,
+        Err(e) => {
+            error(e);
+            File::open("/dev/null")?
+        }
+    };
+    let mut dmenu = Command::new("dmenu")
         .args(["-p", "scry", "-l", "30", "-i"])
-        .stdin(match card_list() {
-            Ok(f) => Stdio::from(f),
-            Err(e) => {
-                error(e);
-                Stdio::null()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    {
+        let mut line = String::new();
+        let mut reader = BufReader::new(card_list_file);
+        let mut pipe = BufWriter::new(dmenu.stdin.take().expect("stdin was piped"));
+        let mut seen = HashSet::new();
+        while reader.read_line(&mut line)? > 0 {
+            if !seen.contains(&line) {
+                seen.insert(line.clone());
+                pipe.write_all(line.as_bytes())?;
             }
-        })
-        .output()?;
-
+            line.clear();
+        }
+    }
+    let output = dmenu.wait_with_output()?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().into())
     } else if output.status.core_dumped() {
