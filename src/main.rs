@@ -1,5 +1,5 @@
 use anyhow::Context;
-use notify_rust::{Notification, Urgency};
+use notify_rust::{Notification, NotificationHandle, Urgency};
 use scryfall::{
     card::{Card, Game},
     error::ScryfallError,
@@ -19,7 +19,7 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-fn notify<T, B>(title: T, body: B)
+fn notify<T, B>(title: T, body: B) -> NotificationHandle
 where
     T: Display,
     B: Display,
@@ -29,7 +29,7 @@ where
         .body(&format!("{body}"))
         .urgency(Urgency::Low)
         .show()
-        .unwrap();
+        .unwrap()
 }
 
 fn error(e: anyhow::Error) {
@@ -231,6 +231,47 @@ fn query() -> anyhow::Result<String> {
     }
 }
 
+struct ProgressNotifier {
+    total: usize,
+    current: usize,
+    last_notif: usize,
+    notification_handle: Option<NotificationHandle>,
+}
+
+impl ProgressNotifier {
+    fn new(total: usize) -> Self {
+        let mut this = Self {
+            total,
+            current: 0,
+            last_notif: 0,
+            notification_handle: None,
+        };
+        this.notify();
+        this
+    }
+
+    fn progress(&mut self) {
+        self.current += 1;
+        self.notify();
+    }
+
+    fn notify(&mut self) {
+        if (self.current * 10 / self.total) == self.last_notif {
+            let body = format!("{}/{} done", self.current, self.total);
+            match self.notification_handle.as_mut() {
+                Some(handle) => {
+                    handle.body(&body);
+                    handle.update();
+                }
+                None => {
+                    self.notification_handle = Some(notify("Downloading", body));
+                }
+            }
+            self.last_notif += 1;
+        }
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     let query = query()?;
     if query.is_empty() {
@@ -268,11 +309,13 @@ fn run() -> anyhow::Result<()> {
     }
 
     let client = reqwest::blocking::Client::new();
+    let mut progress = ProgressNotifier::new(cards.len());
     let files = cards
         .into_iter()
         .map(|card| -> anyhow::Result<NamedTempFile> {
             let mut file = NamedTempFile::new()?;
             client.get(card).send()?.copy_to(&mut file)?;
+            progress.progress();
             Ok(file)
         })
         .collect::<Result<Vec<_>, _>>()?;
