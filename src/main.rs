@@ -19,26 +19,51 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-fn notify<T, B>(title: T, body: B) -> NotificationHandle
+fn notify<T, B>(title: T, body: B) -> Option<NotificationHandle>
 where
     T: Display,
     B: Display,
 {
-    Notification::new()
-        .summary(&format!("{title}"))
-        .body(&format!("{body}"))
+    let summary = format!("{title}");
+    let body = format!("{body}");
+    let e = Notification::new()
+        .summary(&summary)
+        .body(&body)
         .urgency(Urgency::Low)
-        .show()
-        .unwrap()
+        .show();
+    match e {
+        Ok(h) => Some(h),
+        Err(e) => {
+            println!("failed to notify: {e}");
+            backup_notify(&summary, &body, "low");
+            None
+        }
+    }
 }
 
 fn error(e: anyhow::Error) {
-    Notification::new()
-        .summary("Error foretelling")
-        .body(&format!("{e:?}"))
+    let summary = "Error foretelling";
+    let body = format!("{e:?}");
+    let e = Notification::new()
+        .summary(summary)
+        .body(&body)
         .urgency(Urgency::Critical)
-        .show()
-        .unwrap();
+        .show();
+    if let Err(e) = e {
+        println!("failed to notify error: {e}");
+        backup_notify(summary, &body, "critical");
+    }
+}
+
+fn backup_notify(summary: &str, body: &str, urgency: &str) {
+    let child = Command::new("notify-send")
+        .args([summary, body, "-u", urgency])
+        .spawn();
+    if let Ok(mut child) = child {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
@@ -264,7 +289,7 @@ impl ProgressNotifier {
                     handle.update();
                 }
                 None => {
-                    self.notification_handle = Some(notify("Downloading", body));
+                    self.notification_handle = notify("Downloading", body);
                 }
             }
             self.last_notif += 1;
