@@ -1,4 +1,5 @@
 use anyhow::Context;
+use futures_util::{stream::StreamExt, TryStreamExt};
 use notify_rust::{Notification, NotificationHandle, Urgency};
 use scryfall::{
     card::{Card, Game},
@@ -7,17 +8,18 @@ use scryfall::{
     Error, Set,
 };
 use std::{
-    cell::RefCell,
-    collections::HashSet,
-    fmt::Display,
-    fs::{self, File},
-    io::{self, BufRead, BufReader, BufWriter, Write},
-    os::unix::prelude::ExitStatusExt,
-    path::Path,
-    process::{Command, Stdio},
-    thread::{self, JoinHandle},
+    collections::HashSet, fmt::Display, future, os::unix::process::ExitStatusExt, path::Path,
+    process::Stdio,
 };
 use tempfile::NamedTempFile;
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
+    process::Command,
+    sync::Mutex,
+    task::{self, JoinHandle},
+};
+use tokio_stream::wrappers::LinesStream;
 
 fn notify<T, B>(title: T, body: B) -> Option<NotificationHandle>
 where
@@ -60,41 +62,51 @@ fn backup_notify(summary: &str, body: &str, urgency: &str) {
         .args([summary, body, "-u", urgency])
         .spawn();
     if let Ok(mut child) = child {
-        thread::spawn(move || {
-            let _ = child.wait();
+        task::spawn(async move {
+            let _ = child.wait().await;
         });
     }
 }
 
-fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
-    let stored_sets = match File::open(sets_cache) {
-        Ok(f) => BufReader::new(f).lines().collect::<Result<Vec<_>, _>>()?,
+async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
+    let stored_sets = match File::open(sets_cache).await {
+        Ok(f) => {
+            LinesStream::new(BufReader::new(f).lines())
+                .try_collect::<Vec<_>>()
+                .await?
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
         Err(e) => return Err(e.into()),
     };
     let mut all_sets = Vec::new();
     let mut updated_cards = false;
-    let today = chrono::Utc::today().naive_utc();
-    for Set {
+    let today = chrono::Utc::now().naive_utc().date();
+    let sets = scryfall::set::Set::all()
+        .await?
+        .into_stream()
+        .filter_map(|o| future::ready(o.ok()))
+        .filter(|s| {
+            future::ready(
+                [
+                    SetType::Memorabilia,
+                    SetType::Token,
+                    SetType::Alchemy,
+                    SetType::TreasureChest,
+                    SetType::Promo,
+                ]
+                .into_iter()
+                .all(|t| s.set_type != t),
+            )
+        })
+        .filter(|s| future::ready(!s.digital))
+        .filter(|s| future::ready(matches!(s.released_at, Some(d) if d <= today)));
+    tokio::pin!(sets);
+    while let Some(Set {
         code,
         name,
         set_type,
         ..
-    } in scryfall::set::Set::all()?
-        .filter_map(Result::ok)
-        .filter(|s| {
-            [
-                SetType::Memorabilia,
-                SetType::Token,
-                SetType::Alchemy,
-                SetType::TreasureChest,
-                SetType::Promo,
-            ]
-            .into_iter()
-            .all(|t| s.set_type != t)
-        })
-        .filter(|s| !s.digital)
-        .filter(|s| matches!(s.released_at, Some(d) if d <= today))
+    }) = sets.next().await
     {
         all_sets.push(code);
         if stored_sets
@@ -103,6 +115,7 @@ fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
         {
             println!("updating card list for {name} ({code}) :: {set_type}");
             match update_card_list(cards_cache, code, &name)
+                .await
                 .with_context(|| format!("updating card list for set {name} ({code})"))
             {
                 Ok(true) => updated_cards = true,
@@ -118,17 +131,16 @@ fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
     }
     if updated_cards {
         all_sets.sort();
-        store_sets(sets_cache, &all_sets)?;
+        store_sets(sets_cache, &all_sets).await?;
     }
     return Ok(());
 
-    fn store_sets(cache: &Path, sets: &[SetCode]) -> anyhow::Result<()> {
-        sets.iter()
-            .try_fold(BufWriter::new(File::create(&cache)?), |mut file, code| {
-                file.write_all(code.get().as_bytes())?;
-                file.write_all(b"\n")?;
-                io::Result::Ok(file)
-            })?;
+    async fn store_sets(cache: &Path, sets: &[SetCode]) -> anyhow::Result<()> {
+        let mut file = BufWriter::new(File::create(&cache).await?);
+        for code in sets {
+            file.write_all(code.get().as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
         Ok(())
     }
 }
@@ -137,28 +149,43 @@ fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
 ///
 /// if no cards were found for a set, return Ok(false)
 /// this happens when new sets are added before their cards are added.
-fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> anyhow::Result<bool> {
+async fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> anyhow::Result<bool> {
     let mut file = BufWriter::new(
-        File::options()
+        OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
+            .await
             .with_context(|| format!("opening card list at {path:?}"))?,
     );
 
     const JUST_DONT: &str = "Our Market Research Shows That Players Like Really Long Card Names So We Made this Card to Have the Absolute Longest Card Name Ever Elemental";
     use scryfall::search::prelude::*;
-    let today = chrono::Utc::today().naive_utc();
-    let count = match Card::search(set(set_code).and(game(Game::Paper)).and(date(lte(today)))) {
-        Ok(cards) => cards
-            .filter_map(Result::ok)
-            .filter(|c| !c.type_line.contains("Basic") && !c.type_line.contains("Token"))
-            .map(|c| c.name)
-            .filter(|n| n != JUST_DONT)
-            .try_fold(0, |count, name| {
-                file.write_fmt(format_args!("{name}\n"))?;
-                io::Result::Ok(count + 1)
-            })?,
+    let today = chrono::Utc::now().naive_utc().date();
+    let count = match Card::search(set(set_code).and(game(Game::Paper)).and(date(lte(today)))).await
+    {
+        Ok(cards) => {
+            let file = &mut file;
+            let card_names = cards
+                .into_stream()
+                .filter_map(|o| future::ready(o.ok()))
+                .filter(|c| -> future::Ready<bool> {
+                    future::ready(
+                        c.type_line.as_deref() != Some("Basic")
+                            && c.type_line.as_deref() != Some("Token"),
+                    )
+                })
+                .map(|c| c.name)
+                .filter(|n| future::ready(n != JUST_DONT));
+            tokio::pin!(card_names);
+            let mut count = 0;
+            while let Some(name) = card_names.next().await {
+                file.write_all(name.as_bytes()).await?;
+                file.write_all(b"\n").await?;
+                count += 1;
+            }
+            count
+        }
         Err(Error::ScryfallError(ScryfallError { status: 404, .. })) => return Ok(false),
         Err(e) => return Err(e.into()),
     };
@@ -170,57 +197,57 @@ fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> anyhow::R
     Ok(true)
 }
 
-thread_local! {
-    static BACKGROUND_UPDATE: RefCell<Option<JoinHandle<()>>> = RefCell::new(None);
-}
+static BACKGROUND_UPDATE: Mutex<Option<JoinHandle<()>>> = Mutex::const_new(None);
 
-fn card_list() -> anyhow::Result<File> {
+async fn card_list() -> anyhow::Result<File> {
     let path = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("can't find cache dir"))?
         .join("foretell");
 
-    fs::create_dir_all(&path).context("creating cache dir")?;
+    fs::create_dir_all(&path)
+        .await
+        .context("creating cache dir")?;
 
     println!("getting missing sets");
     let sets_cache = path.join("sets");
     let card_list_file = path.join("cards");
     let lock_file = path.join("lock");
-    let _ = File::options()
+    let _ = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&lock_file);
     match fmutex::try_lock(&lock_file) {
         Ok(Some(guard)) => {
-            let handle = thread::spawn({
+            let handle = tokio::spawn({
                 let card_list_file = card_list_file.clone();
-                move || {
-                    if let Err(e) = missing_sets(&sets_cache, &card_list_file) {
+                async move {
+                    if let Err(e) = missing_sets(&sets_cache, &card_list_file).await {
                         error(e)
                     }
                     drop(guard);
                 }
             });
-            BACKGROUND_UPDATE.with(|u| *u.borrow_mut() = Some(handle));
+            *BACKGROUND_UPDATE.lock().await = Some(handle);
         }
         Ok(None) => {}
         Err(e) => error(anyhow::anyhow!("failed to lock {lock_file:?}: {e}")),
     }
 
-    match File::open(card_list_file) {
+    match File::open(card_list_file).await {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            File::open("/dev/null").map_err(Into::into)
+            File::open("/dev/null").await.map_err(Into::into)
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn query() -> anyhow::Result<String> {
-    let card_list_file = match card_list() {
+async fn query() -> anyhow::Result<String> {
+    let card_list_file = match card_list().await {
         Ok(f) => f,
         Err(e) => {
             error(e);
-            File::open("/dev/null")?
+            File::open("/dev/null").await?
         }
     };
     let mut dmenu = Command::new("dmenu")
@@ -233,15 +260,15 @@ fn query() -> anyhow::Result<String> {
         let mut reader = BufReader::new(card_list_file);
         let mut pipe = BufWriter::new(dmenu.stdin.take().expect("stdin was piped"));
         let mut seen = HashSet::new();
-        while reader.read_line(&mut line)? > 0 {
+        while reader.read_line(&mut line).await? > 0 {
             if !seen.contains(&line) {
                 seen.insert(line.clone());
-                pipe.write_all(line.as_bytes())?;
+                pipe.write_all(line.as_bytes()).await?;
             }
             line.clear();
         }
     }
-    let output = dmenu.wait_with_output()?;
+    let output = dmenu.wait_with_output().await?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().into())
     } else if output.status.core_dumped() {
@@ -297,12 +324,14 @@ impl ProgressNotifier {
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let query = query()?;
+async fn run() -> anyhow::Result<()> {
+    let query = query().await?;
     if query.is_empty() {
         return Ok(());
     }
-    let cards = Card::search(&query)?
+    let cards = Card::search(&query)
+        .await?
+        .into_stream()
         .map(|c| {
             c.map(|mut c| {
                 let uris = if let Some(large) = c.image_uris.remove("large") {
@@ -324,10 +353,11 @@ fn run() -> anyhow::Result<()> {
                 uris
             })
         })
-        .try_fold(Vec::new(), |mut acc, v| -> Result<_, Error> {
-            acc.extend(v?);
-            Ok(acc)
-        })?;
+        .try_fold(Vec::new(), |mut acc, v| async move {
+            acc.extend(v);
+            Ok::<_, Error>(acc)
+        })
+        .await?;
 
     if cards.is_empty() {
         return Err(anyhow::anyhow!("no cards found"));
@@ -349,7 +379,8 @@ fn run() -> anyhow::Result<()> {
         .args(["-b", "-g", "590x800"])
         .args(files.iter().map(|f| f.path()))
         .spawn()?
-        .wait()?;
+        .wait()
+        .await?;
     if !status.success() {
         Err(anyhow::anyhow!("sxiv error {status}"))
     } else {
@@ -357,17 +388,17 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         error(e)
     }
-    BACKGROUND_UPDATE.with(|j| {
-        if let Some(j) = j.borrow_mut().take() {
-            if let Err(e) = j.join() {
-                error(anyhow::anyhow!("background update thread panicked: {e:?}"));
-            } else {
-                println!("background task ended");
-            }
+    let mut j = BACKGROUND_UPDATE.lock().await;
+    if let Some(j) = j.take() {
+        if let Err(e) = j.await {
+            error(anyhow::anyhow!("background update thread panicked: {e:?}"));
+        } else {
+            println!("background task ended");
         }
-    })
+    }
 }
