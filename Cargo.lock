@@ -439,7 +439,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "foretell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1326,9 +1326,9 @@ checksum = "ddccb15bcce173023b3fedd9436f882a0739b8dfb45e4f6b6002bee5929f61b2"
 
 [[package]]
 name = "scryfall"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a970a037ef254e0fb3c365302fc00408f6431b8dfde2b8c3cb24104ba389396"
+checksum = "182101f8eb08107b8c7334349a490d60751f9527e301c49f170ff4c1c184f673"
 dependencies = [
  "async-trait",
  "cfg-if",
