@@ -141,6 +141,7 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
             file.write_all(code.get().as_bytes()).await?;
             file.write_all(b"\n").await?;
         }
+        file.flush().await?;
         Ok(())
     }
 }
@@ -184,6 +185,7 @@ async fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> any
                 file.write_all(b"\n").await?;
                 count += 1;
             }
+            file.flush().await?;
             count
         }
         Err(Error::ScryfallError(ScryfallError { status: 404, .. })) => return Ok(false),
