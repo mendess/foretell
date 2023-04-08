@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chrono::{Duration, NaiveDate};
 use futures_util::{stream::StreamExt, TryStreamExt};
 use notify_rust::{Notification, NotificationHandle, Urgency};
 use scryfall::{
@@ -9,7 +10,7 @@ use scryfall::{
 };
 use std::{
     collections::HashSet, fmt::Display, future, os::unix::process::ExitStatusExt, path::Path,
-    process::Stdio,
+    process::Stdio, thread::available_parallelism,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -68,6 +69,10 @@ fn backup_notify(summary: &str, body: &str, urgency: &str) {
     }
 }
 
+fn new_set_threashold() -> NaiveDate {
+    chrono::Utc::now().naive_utc().date() + Duration::weeks(1)
+}
+
 async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<()> {
     let stored_sets = match File::open(sets_cache).await {
         Ok(f) => {
@@ -78,10 +83,8 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
         Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
         Err(e) => return Err(e.into()),
     };
-    let mut all_sets = Vec::new();
-    let mut updated_cards = false;
-    let today = chrono::Utc::now().naive_utc().date();
-    let sets = scryfall::set::Set::all()
+    let date_threashold = new_set_threashold();
+    let mut all_sets = scryfall::set::Set::all()
         .await?
         .into_stream()
         .filter_map(|o| future::ready(o.ok()))
@@ -99,37 +102,43 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
             )
         })
         .filter(|s| future::ready(!s.digital))
-        .filter(|s| future::ready(matches!(s.released_at, Some(d) if d <= today)));
-    tokio::pin!(sets);
-    while let Some(Set {
-        code,
-        name,
-        set_type,
-        ..
-    }) = sets.next().await
-    {
-        all_sets.push(code);
-        if stored_sets
-            .binary_search_by(|s| s.as_str().cmp(code.get()))
-            .is_err()
-        {
+        .filter(move |s| future::ready(matches!(s.released_at, Some(d) if d <= date_threashold)))
+        .map(|set| {
+            let Set {
+                code,
+                name,
+                set_type,
+                ..
+            } = set;
             println!("updating card list for {name} ({code}) :: {set_type}");
-            match update_card_list(cards_cache, code, &name)
-                .await
-                .with_context(|| format!("updating card list for set {name} ({code})"))
-            {
-                Ok(true) => updated_cards = true,
-                Ok(false) => {
-                    all_sets.pop();
-                }
-                Err(e) => {
-                    all_sets.pop();
-                    error(e);
+            let not_stored = stored_sets
+                .binary_search_by(|s| s.as_str().cmp(set.code.get()))
+                .is_err();
+            async move {
+                if not_stored {
+                    update_card_list(cards_cache, code, &name)
+                        .await
+                        .with_context(|| format!("updating card list for set {name} ({code})"))
+                        .map(|success| success.then_some(code))
+                } else {
+                    Ok(Some(code))
                 }
             }
-        }
-    }
-    if updated_cards {
+        })
+        .buffer_unordered(available_parallelism().unwrap().get())
+        .filter_map(|x| async move {
+            match x {
+                Ok(Some(code)) => Some(code),
+                Ok(None) => None,
+                Err(e) => {
+                    error(e);
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+    if !all_sets.is_empty() {
         all_sets.sort();
         store_sets(sets_cache, &all_sets).await?;
     }
@@ -162,9 +171,7 @@ async fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> any
 
     const JUST_DONT: &str = "Our Market Research Shows That Players Like Really Long Card Names So We Made this Card to Have the Absolute Longest Card Name Ever Elemental";
     use scryfall::search::prelude::*;
-    let today = chrono::Utc::now().naive_utc().date();
-    let count = match Card::search(set(set_code).and(game(Game::Paper)).and(date(lte(today)))).await
-    {
+    let count = match Card::search(set(set_code).and(game(Game::Paper))).await {
         Ok(cards) => {
             let file = &mut file;
             let card_names = cards
@@ -188,7 +195,10 @@ async fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> any
             file.flush().await?;
             count
         }
-        Err(Error::ScryfallError(ScryfallError { status: 404, .. })) => return Ok(false),
+        Err(Error::ScryfallError(e @ ScryfallError { status: 404, .. })) => {
+            eprintln!("got 404 downloading set {set_name} ({set_code}): {e:#?}");
+            return Ok(false);
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -217,7 +227,8 @@ async fn card_list() -> anyhow::Result<File> {
     let _ = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&lock_file);
+        .open(&lock_file)
+        .await;
     match fmutex::try_lock(&lock_file) {
         Ok(Some(guard)) => {
             let handle = tokio::spawn({
@@ -365,21 +376,23 @@ async fn run() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("no cards found"));
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::Client::new();
     let mut progress = ProgressNotifier::new(cards.len());
-    let files = cards
-        .into_iter()
-        .map(|card| -> anyhow::Result<NamedTempFile> {
-            let mut file = NamedTempFile::new()?;
-            client.get(card).send()?.copy_to(&mut file)?;
-            progress.progress();
-            Ok(file)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut files = Vec::with_capacity(cards.len());
+    for card in cards {
+        let (file, path) = NamedTempFile::new()?.into_parts();
+        let mut file = File::from_std(file);
+        let mut bytes = client.get(card).send().await?.bytes_stream();
+        while let Some(b) = bytes.next().await {
+            file.write_all(&b?).await?
+        }
+        progress.progress();
+        files.push(path);
+    }
 
     let status = Command::new("sxiv")
         .args(["-b", "-g", "590x800"])
-        .args(files.iter().map(|f| f.path()))
+        .args(files.iter())
         .spawn()?
         .wait()
         .await?;
