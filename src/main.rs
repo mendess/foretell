@@ -390,17 +390,25 @@ async fn run() -> anyhow::Result<()> {
         files.push(path);
     }
 
-    let status = Command::new("sxiv")
-        .args(["-b", "-g", "590x800"])
-        .args(files.iter())
-        .spawn()?
-        .wait()
-        .await?;
-    if !status.success() {
-        Err(anyhow::anyhow!("sxiv error {status}"))
-    } else {
-        Ok(())
+    for binary in ["sxiv", "nsxiv", "xdg-open"] {
+        let mut cmd = Command::new(binary);
+        if binary.contains("sxiv") {
+            cmd.args(["-b", "-g", "590x800"]);
+        }
+        let mut process = match cmd.args(files.iter()).spawn() {
+            Ok(process) => process,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let status = process.wait().await?;
+        return if !status.success() {
+            Err(anyhow::anyhow!("image viewer error {status}"))
+        } else {
+            Ok(())
+        };
     }
+
+    Ok(())
 }
 
 #[tokio::main]
