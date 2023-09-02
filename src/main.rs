@@ -348,7 +348,7 @@ async fn run() -> anyhow::Result<()> {
         .map(|c| {
             c.map(|mut c| {
                 let uris = if let Some(large) = c.image_uris.remove("large") {
-                    vec![large.to_string()]
+                    vec![large]
                 } else if let Some(faces) = c.card_faces.take() {
                     faces
                         .into_iter()
