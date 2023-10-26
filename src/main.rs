@@ -413,6 +413,12 @@ async fn run() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).is_some_and(|a| a == "--version") {
+        const BIN_NAME: &str = env!("CARGO_PKG_NAME");
+        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        println!("{BIN_NAME} {VERSION}");
+        return;
+    }
     if let Err(e) = run().await {
         error(e)
     }
