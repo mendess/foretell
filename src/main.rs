@@ -345,27 +345,10 @@ async fn run() -> anyhow::Result<()> {
     let cards = Card::search(&query)
         .await?
         .into_stream()
-        .map(|c| {
-            c.map(|mut c| {
-                let uris = if let Some(large) = c.image_uris.remove("large") {
-                    vec![large]
-                } else if let Some(faces) = c.card_faces.take() {
-                    faces
-                        .into_iter()
-                        .filter_map(|face| face.image_uris.and_then(|mut u| u.remove("large")))
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![]
-                };
-                if uris.is_empty() {
-                    error(anyhow::anyhow!(
-                        "failed to get any uris for card {}",
-                        c.name
-                    ));
-                }
-                uris
-            })
-        })
+        .map(|c| c.map(|c| c.image_uris.map(|i| vec![i.large]).unwrap_or_default())) // TODO: this
+        // is a dumb
+        // way to do
+        // this
         .try_fold(Vec::new(), |mut acc, v| async move {
             acc.extend(v);
             Ok::<_, Error>(acc)
