@@ -10,7 +10,7 @@ use scryfall::{
 };
 use std::{
     collections::HashSet, fmt::Display, future, os::unix::process::ExitStatusExt, path::Path,
-    process::Stdio, thread::available_parallelism,
+    process::Stdio, sync::atomic::AtomicBool, thread::available_parallelism,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -84,6 +84,7 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
         Err(e) => return Err(e.into()),
     };
     let date_threashold = new_set_threashold();
+    let card_list_updated = &AtomicBool::new(false);
     let mut all_sets = scryfall::set::Set::all()
         .await?
         .into_stream()
@@ -116,6 +117,7 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
                 .is_err();
             async move {
                 if not_stored {
+                    card_list_updated.store(true, std::sync::atomic::Ordering::SeqCst);
                     update_card_list(cards_cache, code, &name)
                         .await
                         .with_context(|| format!("updating card list for set {name} ({code})"))
@@ -142,6 +144,11 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
         all_sets.sort();
         store_sets(sets_cache, &all_sets).await?;
     }
+    if card_list_updated.load(std::sync::atomic::Ordering::SeqCst) {
+        sort_uniq_cardlist(cards_cache)
+            .await
+            .context("sorting card list")?;
+    }
     return Ok(());
 
     async fn store_sets(cache: &Path, sets: &[SetCode]) -> anyhow::Result<()> {
@@ -151,6 +158,24 @@ async fn missing_sets(sets_cache: &Path, cards_cache: &Path) -> anyhow::Result<(
             file.write_all(b"\n").await?;
         }
         file.flush().await?;
+        Ok(())
+    }
+
+    async fn sort_uniq_cardlist(cache: &Path) -> anyhow::Result<()> {
+        let mut names = LinesStream::new(BufReader::new(File::open(cache).await?).lines())
+            .try_collect::<Vec<_>>()
+            .await?;
+        names.sort_unstable();
+        names.dedup();
+        let (file, path) = NamedTempFile::new_in(cache.parent().unwrap())?.into_parts();
+        let mut writer = BufWriter::new(File::from_std(file));
+        for name in names {
+            writer.write_all(name.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+        }
+        writer.flush().await?;
+        path.persist(cache)?;
+
         Ok(())
     }
 }
