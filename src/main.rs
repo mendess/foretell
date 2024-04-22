@@ -9,8 +9,14 @@ use scryfall::{
     Error, Set,
 };
 use std::{
-    collections::HashSet, fmt::Display, future, os::unix::process::ExitStatusExt, path::Path,
-    process::Stdio, sync::atomic::AtomicBool, thread::available_parallelism,
+    collections::HashSet,
+    fmt::Display,
+    future::{self, ready},
+    os::unix::process::ExitStatusExt,
+    path::Path,
+    process::Stdio,
+    sync::atomic::AtomicBool,
+    thread::available_parallelism,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -370,14 +376,16 @@ async fn run() -> anyhow::Result<()> {
     let cards = Card::search(&query)
         .await?
         .into_stream()
-        .map(|c| c.map(|c| c.image_uris.map(|i| vec![i.large]).unwrap_or_default())) // TODO: this
-        // is a dumb
-        // way to do
-        // this
-        .try_fold(Vec::new(), |mut acc, v| async move {
-            acc.extend(v);
-            Ok::<_, Error>(acc)
+        .filter_map(|c| {
+            ready(
+                c.map(|c| {
+                    c.image_uris
+                        .and_then(|i| i.large.or(i.png).or(i.normal).or(i.small))
+                })
+                .transpose(),
+            )
         })
+        .try_collect::<Vec<_>>()
         .await?;
 
     if cards.is_empty() {
