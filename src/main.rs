@@ -4,7 +4,6 @@ use futures_util::{stream::StreamExt, TryStreamExt};
 use notify_rust::{Notification, NotificationHandle, Urgency};
 use scryfall::{
     card::{Card, Game},
-    error::ScryfallError,
     set::{SetCode, SetType},
     Error, Set,
 };
@@ -226,7 +225,7 @@ async fn update_card_list(path: &Path, set_code: SetCode, set_name: &str) -> any
             file.flush().await?;
             count
         }
-        Err(Error::ScryfallError(e @ ScryfallError { status: 404, .. })) => {
+        Err(Error::ScryfallError(e)) if e.status == 404 => {
             eprintln!("got 404 downloading set {set_name} ({set_code}): {e:#?}");
             return Ok(false);
         }

@@ -13,7 +13,7 @@ fmutex = "0.1.0"
 futures-util = "0.3.30"
 notify-rust = "4.11.0"
 reqwest = { version = "0.11.27", features = ["stream"] }
-scryfall = "0.16.2"
+scryfall = "0.17.9"
 tempfile = "3.10.1"
 tokio = { features = ["rt-multi-thread", "process", "io-util", "fs", "macros", "sync", "parking_lot"], version = "1.37.0" }
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
