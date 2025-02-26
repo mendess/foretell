@@ -1,11 +1,11 @@
 use anyhow::Context;
 use chrono::{Duration, NaiveDate};
-use futures_util::{stream::StreamExt, TryStreamExt};
+use futures_util::{TryStreamExt, stream::StreamExt};
 use notify_rust::{Notification, NotificationHandle, Urgency};
 use scryfall::{
+    Error, Set,
     card::{Card, Game},
     set::{SetCode, SetType},
-    Error, Set,
 };
 use std::{
     collections::HashSet,
